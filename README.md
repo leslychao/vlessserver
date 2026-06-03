@@ -76,6 +76,8 @@ Add these GitHub repository secrets:
 - `DEPLOY_PORT`: optional SSH port, defaults to `22`.
 - `PROXY_STACK_ENV`: full multiline contents of the server `.env`.
 
+`PROXY_STACK_ENV` must include the full production stack environment, not only deploy credentials. At minimum it must contain `XUI_ADMIN_USERNAME`, `XUI_ADMIN_PASSWORD`, `MTG_SECRET`, `VLESS_REMARK`, and `VLESS_CLIENT_EMAIL`.
+
 The workflow deploys on pushes to `main` and can also be run manually from the Actions tab.
 
 ## Access

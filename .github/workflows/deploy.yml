@@ -205,6 +205,22 @@ jobs:
           cat > .deploy.env <<'EOF_ENV'
           ${{ secrets.PROXY_STACK_ENV }}
           EOF_ENV
+          sed -i 's/\r$//' .deploy.env
+
+          required_env_keys=(
+            XUI_ADMIN_USERNAME
+            XUI_ADMIN_PASSWORD
+            MTG_SECRET
+            VLESS_REMARK
+            VLESS_CLIENT_EMAIL
+          )
+          for key in "${required_env_keys[@]}"; do
+            if ! grep -Eq "^${key}=.+" .deploy.env; then
+              echo "::error::PROXY_STACK_ENV must contain a non-empty ${key}=... line. Paste the full production .env content into the PROXY_STACK_ENV GitHub secret."
+              exit 1
+            fi
+          done
+
           ./.deploy/scp-command.sh -P "$DEPLOY_PORT" .deploy.env "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$DEPLOY_DIR/.env"
           rm -f .deploy.env
 
