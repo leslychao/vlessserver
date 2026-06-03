@@ -1,0 +1,272 @@
+name: Deploy proxy stack
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: proxy-stack-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      DEPLOY_DIR: /opt/proxy-stack/app
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+
+          if [[ -n "$DEPLOY_SSH_KEY" ]]; then
+            install -m 600 /dev/null ~/.ssh/deploy_key
+            printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          elif [[ -n "$DEPLOY_PASSWORD" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y sshpass
+          else
+            echo "::error::Set DEPLOY_SSH_KEY or DEPLOY_PASSWORD in GitHub Secrets"
+            exit 1
+          fi
+
+          install -m 700 -d .deploy
+          cat > .deploy/ssh-command.sh <<'EOF_SSH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ -n "${DEPLOY_SSH_KEY:-}" ]]; then
+            exec ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes "$@"
+          fi
+          export SSHPASS="${DEPLOY_PASSWORD:?}"
+          exec sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "$@"
+          EOF_SSH
+          cat > .deploy/scp-command.sh <<'EOF_SCP'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ -n "${DEPLOY_SSH_KEY:-}" ]]; then
+            exec scp -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes "$@"
+          fi
+          export SSHPASS="${DEPLOY_PASSWORD:?}"
+          exec sshpass -e scp -o PreferredAuthentications=password -o PubkeyAuthentication=no "$@"
+          EOF_SCP
+          chmod 0700 .deploy/ssh-command.sh .deploy/scp-command.sh
+
+          ssh-keyscan -p "$DEPLOY_PORT" -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Prepare remote directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.deploy/ssh-command.sh -p "$DEPLOY_PORT" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'bash -se' <<'EOF_REMOTE'
+          set -euo pipefail
+
+          if [[ "$(id -u)" -eq 0 ]]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "[deploy] ERROR: root or sudo access is required to prepare /opt/proxy-stack" >&2
+            exit 1
+          fi
+
+          $SUDO mkdir -p /opt/proxy-stack/app /opt/proxy-stack/data
+          $SUDO chown -R "$(id -un):$(id -gn)" /opt/proxy-stack
+          EOF_REMOTE
+
+      - name: Bootstrap Docker on remote host
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.deploy/ssh-command.sh -p "$DEPLOY_PORT" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'bash -se' <<'EOF_REMOTE'
+          set -euo pipefail
+
+          log() {
+            printf '[docker-bootstrap] %s\n' "$*"
+          }
+
+          if [[ "$(id -u)" -eq 0 ]]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "[docker-bootstrap] ERROR: root or sudo access is required to install Docker" >&2
+            exit 1
+          fi
+
+          install_fetch_tools() {
+            if command -v curl >/dev/null 2>&1 && { [[ -d /etc/ssl/certs ]] || [[ -f /etc/ssl/certs/ca-certificates.crt ]]; }; then
+              return
+            fi
+
+            log "Installing curl and CA certificates"
+            if command -v apt-get >/dev/null 2>&1; then
+              $SUDO apt-get update
+              $SUDO apt-get install -y ca-certificates curl
+            elif command -v dnf >/dev/null 2>&1; then
+              $SUDO dnf install -y ca-certificates curl
+            elif command -v yum >/dev/null 2>&1; then
+              $SUDO yum install -y ca-certificates curl
+            elif command -v apk >/dev/null 2>&1; then
+              $SUDO apk add --no-cache ca-certificates curl
+            else
+              echo "[docker-bootstrap] ERROR: unsupported package manager; install Docker manually" >&2
+              exit 1
+            fi
+          }
+
+          install_compose_plugin() {
+            log "Installing Docker Compose plugin"
+            if command -v apt-get >/dev/null 2>&1; then
+              $SUDO apt-get update
+              $SUDO apt-get install -y docker-compose-plugin
+            elif command -v dnf >/dev/null 2>&1; then
+              $SUDO dnf install -y docker-compose-plugin || $SUDO dnf install -y docker-compose
+            elif command -v yum >/dev/null 2>&1; then
+              $SUDO yum install -y docker-compose-plugin || $SUDO yum install -y docker-compose
+            elif command -v apk >/dev/null 2>&1; then
+              $SUDO apk add --no-cache docker-cli-compose
+            else
+              echo "[docker-bootstrap] ERROR: unsupported package manager; install Docker Compose manually" >&2
+              exit 1
+            fi
+          }
+
+          start_docker_service() {
+            if command -v systemctl >/dev/null 2>&1; then
+              $SUDO systemctl enable --now docker || true
+            elif command -v service >/dev/null 2>&1; then
+              $SUDO service docker start || true
+            fi
+          }
+
+          if command -v docker >/dev/null 2>&1 && $SUDO docker compose version >/dev/null 2>&1; then
+            start_docker_service
+            log "Docker and Docker Compose are already installed"
+            $SUDO docker version --format 'Docker {{.Server.Version}}'
+            $SUDO docker compose version
+            if $SUDO docker info >/dev/null 2>&1; then
+              exit 0
+            fi
+            log "Docker is installed but the daemon is not ready yet; continuing bootstrap"
+          fi
+
+          install_fetch_tools
+
+          if ! command -v docker >/dev/null 2>&1; then
+            log "Installing Docker Engine"
+            curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+            $SUDO sh /tmp/get-docker.sh
+            rm -f /tmp/get-docker.sh
+          fi
+
+          start_docker_service
+
+          if ! $SUDO docker compose version >/dev/null 2>&1; then
+            install_compose_plugin
+          fi
+
+          start_docker_service
+
+          $SUDO docker version --format 'Docker {{.Server.Version}}'
+          $SUDO docker compose version
+          EOF_REMOTE
+
+      - name: Upload application files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rsync -az --delete \
+            --exclude='.git/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='.deploy/' \
+            --exclude='data/' \
+            --exclude='output/' \
+            -e "./.deploy/ssh-command.sh -p $DEPLOY_PORT" \
+            ./ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$DEPLOY_DIR/"
+
+      - name: Upload server environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null .deploy.env
+          cat > .deploy.env <<'EOF_ENV'
+          ${{ secrets.PROXY_STACK_ENV }}
+          EOF_ENV
+          ./.deploy/scp-command.sh -P "$DEPLOY_PORT" .deploy.env "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$DEPLOY_DIR/.env"
+          rm -f .deploy.env
+
+      - name: Deploy with Docker Compose
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.deploy/ssh-command.sh -p "$DEPLOY_PORT" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'bash -se' <<'EOF_REMOTE'
+          set -euo pipefail
+          cd /opt/proxy-stack/app
+
+          if [[ "$(id -u)" -eq 0 ]]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "[deploy] ERROR: root or sudo access is required to run Docker" >&2
+            exit 1
+          fi
+
+          $SUDO docker compose --env-file .env config >/dev/null
+          $SUDO docker compose --env-file .env pull mtg
+          $SUDO docker compose --env-file .env build --pull xui xui-provision
+          $SUDO docker compose --env-file .env up -d xui mtg
+
+          $SUDO docker compose --env-file .env run --rm xui-provision
+          $SUDO docker compose --env-file .env run --rm xui-provision
+
+          env_value() {
+            local key="$1"
+            local value
+            value="$(grep -E "^${key}=" .env | tail -n 1 | cut -d= -f2- || true)"
+            value="${value%$'\r'}"
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+            printf '%s' "$value"
+          }
+
+          panel_path="$(env_value XUI_PANEL_WEB_BASE_PATH)"
+          panel_port="$(env_value XUI_PANEL_PORT)"
+          tls_enabled="$(env_value XUI_PANEL_TLS_ENABLED)"
+          vless_port="$(env_value VLESS_PORT)"
+          mtg_port="$(env_value MTG_BIND_PORT)"
+
+          panel_path="${panel_path:-/admin/}"
+          panel_port="${panel_port:-20530}"
+          tls_enabled="${tls_enabled:-true}"
+          vless_port="${vless_port:-443}"
+          mtg_port="${mtg_port:-8443}"
+          [[ "$panel_path" == /* ]] || panel_path="/$panel_path"
+          [[ "$panel_path" == */ ]] || panel_path="$panel_path/"
+          panel_scheme="http"
+          curl_tls_flag=()
+          if [[ "$tls_enabled" == "true" ]]; then
+            panel_scheme="https"
+            curl_tls_flag=(-k)
+          fi
+
+          curl "${curl_tls_flag[@]}" -fsS "${panel_scheme}://127.0.0.1:${panel_port}${panel_path}" >/dev/null
+          ss -ltn | grep -E "[:.]${vless_port}[[:space:]]" >/dev/null
+          ss -ltn | grep -E "[:.]${mtg_port}[[:space:]]" >/dev/null
+          $SUDO docker compose --env-file .env ps
+          EOF_REMOTE

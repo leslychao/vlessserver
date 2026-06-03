@@ -1,0 +1,79 @@
+services:
+  xui:
+    build:
+      context: .
+      dockerfile: xui/Dockerfile
+      args:
+        XUI_IMAGE: ${XUI_IMAGE:-ghcr.io/mhsanaei/3x-ui:v2.9.0}
+    image: ${XUI_WRAPPER_IMAGE:-proxy-stack-xui:local}
+    container_name: xui
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      XRAY_VMESS_AEAD_FORCED: "false"
+      TZ: ${TZ:-UTC}
+      XUI_ADMIN_USERNAME: ${XUI_ADMIN_USERNAME:?Set XUI_ADMIN_USERNAME in .env}
+      XUI_ADMIN_PASSWORD: ${XUI_ADMIN_PASSWORD:?Set XUI_ADMIN_PASSWORD in .env}
+      XUI_PANEL_PORT: ${XUI_PANEL_PORT:-20530}
+      XUI_PANEL_WEB_BASE_PATH: ${XUI_PANEL_WEB_BASE_PATH:-/admin/}
+      XUI_PANEL_LISTEN_IP: ${XUI_PANEL_LISTEN_IP:-0.0.0.0}
+      XUI_PANEL_TLS_ENABLED: ${XUI_PANEL_TLS_ENABLED:-true}
+      XUI_PANEL_CERT_FILE: ${XUI_PANEL_CERT_FILE:-}
+      XUI_PANEL_KEY_FILE: ${XUI_PANEL_KEY_FILE:-}
+      XUI_PANEL_CERT_COMMON_NAME: ${XUI_PANEL_CERT_COMMON_NAME:-proxy-stack-panel}
+      XUI_ENABLE_FAIL2BAN: ${XUI_ENABLE_FAIL2BAN:-true}
+    volumes:
+      - ${XUI_DB_DIR:-/opt/proxy-stack/data/xui/db}:/etc/x-ui/
+      - ${XUI_CERT_DIR:-/opt/proxy-stack/data/xui/cert}:/root/cert/
+      - ${XUI_LOG_DIR:-/opt/proxy-stack/data/xui/log}:/var/log/x-ui/
+
+  mtg:
+    image: ${MTG_IMAGE:-ghcr.io/9seconds/mtg:2.2.4}
+    container_name: mtg
+    restart: unless-stopped
+    network_mode: host
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    command:
+      - simple-run
+      - 0.0.0.0:${MTG_BIND_PORT:-8443}
+      - ${MTG_SECRET:?Set MTG_SECRET in .env}
+
+  xui-provision:
+    build:
+      context: .
+      dockerfile: provisioner/Dockerfile
+    image: proxy-stack-xui-provision:local
+    profiles:
+      - provision
+    network_mode: host
+    depends_on:
+      - xui
+    restart: "no"
+    environment:
+      TZ: ${TZ:-UTC}
+      PUBLIC_HOST: ${PUBLIC_HOST:-}
+      XUI_ADMIN_USERNAME: ${XUI_ADMIN_USERNAME:?Set XUI_ADMIN_USERNAME in .env}
+      XUI_ADMIN_PASSWORD: ${XUI_ADMIN_PASSWORD:?Set XUI_ADMIN_PASSWORD in .env}
+      XUI_PANEL_PORT: ${XUI_PANEL_PORT:-20530}
+      XUI_PANEL_WEB_BASE_PATH: ${XUI_PANEL_WEB_BASE_PATH:-/admin/}
+      XUI_PANEL_TLS_ENABLED: ${XUI_PANEL_TLS_ENABLED:-true}
+      XUI_PANEL_INSECURE_TLS: ${XUI_PANEL_INSECURE_TLS:-true}
+      VLESS_REMARK: ${VLESS_REMARK:-vless-reality-main}
+      VLESS_PORT: ${VLESS_PORT:-443}
+      VLESS_CLIENT_EMAIL: ${VLESS_CLIENT_EMAIL:-main-client}
+      VLESS_CLIENT_FLOW: ${VLESS_CLIENT_FLOW:-xtls-rprx-vision}
+      VLESS_REALITY_TARGET: ${VLESS_REALITY_TARGET:-www.cloudflare.com:443}
+      VLESS_REALITY_SERVER_NAMES: ${VLESS_REALITY_SERVER_NAMES:-www.cloudflare.com,cloudflare.com}
+      VLESS_REALITY_FINGERPRINT: ${VLESS_REALITY_FINGERPRINT:-chrome}
+      VLESS_REALITY_SPIDER_X: ${VLESS_REALITY_SPIDER_X:-/}
+      VLESS_CLIENT_LIMIT_IP: ${VLESS_CLIENT_LIMIT_IP:-0}
+      VLESS_CLIENT_TOTAL_GB: ${VLESS_CLIENT_TOTAL_GB:-0}
+      PROVISION_OUTPUT_FILE: /output/vless-reality.txt
+    volumes:
+      - ${PROVISION_OUTPUT_DIR:-/opt/proxy-stack/data/output}:/output
