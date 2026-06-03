@@ -224,6 +224,172 @@ jobs:
           ./.deploy/scp-command.sh -P "$DEPLOY_PORT" .deploy.env "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$DEPLOY_DIR/.env"
           rm -f .deploy.env
 
+      - name: Configure additional public IPs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.deploy/ssh-command.sh -p "$DEPLOY_PORT" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'bash -se' <<'EOF_REMOTE'
+          set -euo pipefail
+          cd /opt/proxy-stack/app
+
+          log() {
+            printf '[public-ip-bootstrap] %s\n' "$*"
+          }
+
+          if [[ "$(id -u)" -eq 0 ]]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "[public-ip-bootstrap] ERROR: root or sudo access is required to configure public IPs" >&2
+            exit 1
+          fi
+
+          env_value() {
+            local key="$1"
+            local value
+            value="$(grep -E "^${key}=" .env | tail -n 1 | cut -d= -f2- || true)"
+            value="${value%$'\r'}"
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+            printf '%s' "$value"
+          }
+
+          validate_ipv4() {
+            local ip="$1"
+            local a b c d
+            IFS=. read -r a b c d <<< "$ip"
+            for octet in "$a" "$b" "$c" "$d"; do
+              [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+              (( octet >= 0 && octet <= 255 )) || return 1
+            done
+            [[ -n "$a" && -n "$b" && -n "$c" && -n "$d" ]]
+          }
+
+          configured_additional_ips="$(env_value ADDITIONAL_PUBLIC_IPS)"
+          configured_additional_ips="${configured_additional_ips//[[:space:]]/}"
+
+          if [[ -z "$configured_additional_ips" ]]; then
+            log "No additional public IPs requested"
+            exit 0
+          fi
+
+          IFS=',' read -r -a requested_ips <<< "$configured_additional_ips"
+          valid_ips=()
+          for ip in "${requested_ips[@]}"; do
+            [[ -n "$ip" ]] || continue
+            if ! validate_ipv4 "$ip"; then
+              echo "[public-ip-bootstrap] ERROR: invalid IPv4 address in ADDITIONAL_PUBLIC_IPS: $ip" >&2
+              exit 1
+            fi
+            duplicate=false
+            for existing_ip in "${valid_ips[@]}"; do
+              if [[ "$existing_ip" == "$ip" ]]; then
+                duplicate=true
+                break
+              fi
+            done
+            if [[ "$duplicate" == "false" ]]; then
+              valid_ips+=("$ip")
+            fi
+          done
+
+          if [[ "${#valid_ips[@]}" -eq 0 ]]; then
+            log "No valid additional public IPs requested"
+            exit 0
+          fi
+
+          public_host_ips="$(IFS=,; printf '%s' "${valid_ips[*]}")"
+
+          default_iface="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+          if [[ -z "$default_iface" ]]; then
+            echo "[public-ip-bootstrap] ERROR: unable to detect the default IPv4 interface" >&2
+            exit 1
+          fi
+
+          tmp_script="$(mktemp)"
+          cat > "$tmp_script" <<'EOF_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          CONFIG_FILE="/etc/proxy-stack-public-ips.conf"
+          if [[ -f "$CONFIG_FILE" ]]; then
+            # shellcheck disable=SC1090
+            . "$CONFIG_FILE"
+          fi
+
+          ADDITIONAL_PUBLIC_IPS="${ADDITIONAL_PUBLIC_IPS:-}"
+          PUBLIC_IP_INTERFACE="${PUBLIC_IP_INTERFACE:-}"
+
+          log() {
+            printf '[proxy-stack-public-ips] %s\n' "$*"
+          }
+
+          if [[ -z "$ADDITIONAL_PUBLIC_IPS" ]]; then
+            log "No additional public IPs configured"
+            exit 0
+          fi
+
+          if [[ -z "$PUBLIC_IP_INTERFACE" ]]; then
+            PUBLIC_IP_INTERFACE="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+          fi
+          if [[ -z "$PUBLIC_IP_INTERFACE" ]]; then
+            echo "[proxy-stack-public-ips] ERROR: unable to detect the default IPv4 interface" >&2
+            exit 1
+          fi
+
+          IFS=',' read -r -a ips <<< "$ADDITIONAL_PUBLIC_IPS"
+          for raw_ip in "${ips[@]}"; do
+            ip="${raw_ip//[[:space:]]/}"
+            [[ -n "$ip" ]] || continue
+            if ip -4 addr show | awk '{print $2}' | cut -d/ -f1 | grep -Fxq "$ip"; then
+              log "$ip is already assigned"
+              continue
+            fi
+            log "Assigning $ip/32 to $PUBLIC_IP_INTERFACE"
+            ip addr add "$ip/32" dev "$PUBLIC_IP_INTERFACE"
+          done
+          EOF_SCRIPT
+          $SUDO install -m 0755 "$tmp_script" /usr/local/sbin/proxy-stack-public-ips
+          rm -f "$tmp_script"
+
+          tmp_config="$(mktemp)"
+          {
+            printf "ADDITIONAL_PUBLIC_IPS='%s'\n" "$public_host_ips"
+            printf "PUBLIC_IP_INTERFACE='%s'\n" "$default_iface"
+          } > "$tmp_config"
+          $SUDO install -m 0644 "$tmp_config" /etc/proxy-stack-public-ips.conf
+          rm -f "$tmp_config"
+
+          if command -v systemctl >/dev/null 2>&1; then
+            tmp_service="$(mktemp)"
+            cat > "$tmp_service" <<'EOF_SERVICE'
+          [Unit]
+          Description=Proxy Stack additional public IP assignment
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/proxy-stack-public-ips
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF_SERVICE
+            $SUDO install -m 0644 "$tmp_service" /etc/systemd/system/proxy-stack-public-ips.service
+            rm -f "$tmp_service"
+            $SUDO systemctl daemon-reload
+            $SUDO systemctl enable --now proxy-stack-public-ips.service
+            log "Additional public IP systemd service enabled"
+          else
+            $SUDO /usr/local/sbin/proxy-stack-public-ips
+            log "Additional public IPs applied for current runtime; systemd is unavailable"
+          fi
+          EOF_REMOTE
+
       - name: Configure remote firewall
         shell: bash
         run: |

@@ -69,13 +69,18 @@ class XuiClient:
             urllib.request.HTTPSHandler(context=context),
         )
 
-    def request(self, method: str, path: str, data=None, timeout: int = 10):
+    def request(self, method: str, path: str, data=None, form=None, timeout: int = 10):
         url = urllib.parse.urljoin(self.base_url, path.lstrip("/"))
         body = None
         headers = {"Accept": "application/json"}
+        if data is not None and form is not None:
+            raise ValueError("Only one of data or form can be provided")
         if data is not None:
             body = json.dumps(data).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        elif form is not None:
+            body = urllib.parse.urlencode(form).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with self.opener.open(request, timeout=timeout) as response:
@@ -106,6 +111,12 @@ class XuiClient:
         result = self.request(method, f"panel/api/{path}", data=data, timeout=20)
         if isinstance(result, dict) and result.get("success") is False:
             fail(f"3x-ui API call failed at {path}: {result.get('msg', 'unknown error')}")
+        return result
+
+    def panel(self, method: str, path: str, data=None, form=None):
+        result = self.request(method, path, data=data, form=form, timeout=20)
+        if isinstance(result, dict) and result.get("success") is False:
+            fail(f"3x-ui panel call failed at {path}: {result.get('msg', 'unknown error')}")
         return result
 
 
@@ -160,7 +171,27 @@ def detect_public_host() -> str:
         fail("Unable to detect PUBLIC_HOST. Set it explicitly in .env.")
 
 
-def generate_link(public_host: str, inbound: dict) -> str:
+def public_hosts() -> list[str]:
+    hosts: list[str] = []
+    configured = env("PUBLIC_HOST").strip()
+    if configured:
+        hosts.append(configured)
+    else:
+        hosts.append(detect_public_host())
+
+    additional_ips = env("ADDITIONAL_PUBLIC_IPS").strip()
+    if additional_ips:
+        hosts.extend(item.strip() for item in additional_ips.split(",") if item.strip())
+
+    unique_hosts: list[str] = []
+    for host in hosts:
+        if host not in unique_hosts:
+            unique_hosts.append(host)
+
+    return unique_hosts
+
+
+def generate_link(public_host: str, inbound: dict, display_remark: str | None = None) -> str:
     settings = load_nested_json(inbound.get("settings"))
     stream = load_nested_json(inbound.get("streamSettings"))
     clients = settings.get("clients") or []
@@ -189,7 +220,7 @@ def generate_link(public_host: str, inbound: dict) -> str:
         params["flow"] = flow
 
     query = urllib.parse.urlencode({key: value for key, value in params.items() if value})
-    remark = urllib.parse.quote(inbound.get("remark") or env("VLESS_REMARK", "vless-reality-main"))
+    remark = urllib.parse.quote(display_remark or inbound.get("remark") or env("VLESS_REMARK", "vless-reality-main"))
     return f"vless://{client['id']}@{public_host}:{inbound['port']}?{query}#{remark}"
 
 
@@ -208,6 +239,72 @@ def find_existing_inbound(inbounds, remark: str):
     return None
 
 
+def parse_panel_xray_response(response) -> tuple[dict, str]:
+    obj = api_obj(response)
+    if isinstance(obj, str):
+        wrapper = json.loads(obj)
+    elif isinstance(obj, dict):
+        wrapper = obj
+    else:
+        fail("3x-ui returned an unexpected Xray settings response")
+
+    xray_setting = wrapper.get("xraySetting")
+    if isinstance(xray_setting, str):
+        config = json.loads(xray_setting)
+    elif isinstance(xray_setting, dict):
+        config = xray_setting
+    else:
+        fail("3x-ui returned an unexpected xraySetting payload")
+
+    outbound_test_url = wrapper.get("outboundTestUrl") or "https://www.google.com/generate_204"
+    return config, outbound_test_url
+
+
+def configure_origin_sendthrough(client: XuiClient) -> bool:
+    send_through = env("XRAY_OUTBOUND_SEND_THROUGH", "origin").strip()
+    if not send_through:
+        log("Xray outbound sendThrough configuration disabled")
+        return False
+
+    response = client.panel("POST", "panel/xray/")
+    config, outbound_test_url = parse_panel_xray_response(response)
+    outbounds = config.setdefault("outbounds", [])
+    if not isinstance(outbounds, list):
+        fail("xrayTemplateConfig.outbounds must be an array")
+
+    selected = None
+    for outbound in outbounds:
+        if not isinstance(outbound, dict):
+            continue
+        if outbound.get("protocol") == "freedom" and outbound.get("tag") == "direct":
+            selected = outbound
+            break
+        if selected is None and outbound.get("protocol") == "freedom":
+            selected = outbound
+
+    if selected is None:
+        selected = {
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": {"domainStrategy": "AsIs", "redirect": "", "noises": []},
+        }
+        outbounds.insert(0, selected)
+
+    if selected.get("sendThrough") == send_through:
+        log(f"Xray outbound sendThrough already set to {send_through}")
+        return False
+
+    selected["sendThrough"] = send_through
+    payload = json_string(config)
+    client.panel(
+        "POST",
+        "panel/xray/update",
+        form={"xraySetting": payload, "outboundTestUrl": outbound_test_url},
+    )
+    log(f"Xray outbound sendThrough set to {send_through}")
+    return True
+
+
 def main() -> None:
     username = required_env("XUI_ADMIN_USERNAME")
     password = required_env("XUI_ADMIN_PASSWORD")
@@ -220,17 +317,25 @@ def main() -> None:
     wait_for_panel(client)
 
     remark = env("VLESS_REMARK", "vless-reality-main")
-    public_host = detect_public_host()
+    hosts = public_hosts()
     output_file = env("PROVISION_OUTPUT_FILE", "/output/vless-reality.txt")
+
+    xray_config_changed = configure_origin_sendthrough(client)
 
     list_response = client.api("GET", "inbounds/list")
     inbounds = api_obj(list_response) or []
     existing = find_existing_inbound(inbounds, remark)
     if existing:
         log(f"Inbound '{remark}' already exists; no duplicate will be created")
-        link = generate_link(public_host, existing)
-        write_output(output_file, link)
+        links = [generate_link(host, existing, f"{remark}-{host}") for host in hosts]
+        write_output(output_file, "\n".join(links))
         log(f"Connection link written to {output_file}")
+        if xray_config_changed:
+            try:
+                client.api("POST", "server/restartXrayService")
+                log("Xray restart requested")
+            except Exception as exc:
+                log(f"Xray restart request failed; panel background job may restart it later: {exc}")
         return
 
     uuid_response = client.api("GET", "server/getNewUUID")
@@ -335,11 +440,10 @@ def main() -> None:
     except Exception as exc:
         log(f"Xray restart request failed; panel background job may restart it later: {exc}")
 
-    link = generate_link(public_host, created)
-    write_output(output_file, link)
+    links = [generate_link(host, created, f"{remark}-{host}") for host in hosts]
+    write_output(output_file, "\n".join(links))
     log(f"Connection link written to {output_file}")
 
 
 if __name__ == "__main__":
     main()
-

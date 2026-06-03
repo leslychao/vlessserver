@@ -30,6 +30,8 @@ GitHub Actions configures supported host firewalls automatically during deploy. 
 
 The workflow does not enable a disabled firewall, and it cannot configure provider-side cloud firewalls. If the VPS provider has a separate network firewall, allow the same TCP ports there.
 
+When `ADDITIONAL_PUBLIC_IPS` is set, GitHub Actions assigns those IPv4 addresses as `/32` addresses on the server default IPv4 interface and installs a `proxy-stack-public-ips.service` systemd oneshot to reapply them after reboot. The primary `PUBLIC_HOST` address is not reassigned because it should already be configured by the provider or OS.
+
 ## Environment
 
 Create a server-local `.env` from `.env.example` and replace every placeholder secret.
@@ -45,7 +47,9 @@ Important variables:
 
 - `XUI_ADMIN_PASSWORD`: long random panel password.
 - `XUI_PANEL_WEB_BASE_PATH`: non-root hidden panel path, for example `/admin-8f2d6c1a/`.
-- `PUBLIC_HOST`: VPS IP or domain used in generated client links. Leave empty to auto-detect.
+- `PUBLIC_HOST`: primary VPS IP or domain used in the first generated VLESS link. Leave empty to auto-detect.
+- `ADDITIONAL_PUBLIC_IPS`: comma-separated secondary public IPv4 addresses. These are assigned to the VPS interface and get additional generated VLESS links.
+- `XRAY_OUTBOUND_SEND_THROUGH`: defaults to `origin`, so Xray outbound traffic uses the local IP that accepted the inbound connection.
 - `VLESS_PORT`: defaults to `443`.
 - `MTG_BIND_PORT`: defaults to `8443` to avoid the VLESS port.
 - `MTG_SECRET`: generated MTProto secret.
@@ -53,6 +57,7 @@ Important variables:
 - `FIREWALL_OPEN_PANEL_PORT`: defaults to `true`; set to `false` only if the panel is not meant to be public.
 
 The generated VLESS link is written on the server to:
+If `ADDITIONAL_PUBLIC_IPS` contains multiple values, one VLESS link is written for `PUBLIC_HOST` plus one link per additional IP.
 
 ```text
 /opt/proxy-stack/data/output/vless-reality.txt
