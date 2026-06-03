@@ -26,6 +26,10 @@ Open the required firewall ports:
 - `8443/tcp` for MTProto by default.
 - `20530/tcp` for the public 3x-ui panel by default.
 
+GitHub Actions configures supported host firewalls automatically during deploy. It opens the SSH port, `VLESS_PORT`, `MTG_BIND_PORT`, and `XUI_PANEL_PORT` when `FIREWALL_AUTO_CONFIG=true`. Supported host firewalls are active `ufw`, active `firewalld`, and direct `iptables` rules when no managed firewall is active.
+
+The workflow does not enable a disabled firewall, and it cannot configure provider-side cloud firewalls. If the VPS provider has a separate network firewall, allow the same TCP ports there.
+
 ## Environment
 
 Create a server-local `.env` from `.env.example` and replace every placeholder secret.
@@ -45,6 +49,8 @@ Important variables:
 - `VLESS_PORT`: defaults to `443`.
 - `MTG_BIND_PORT`: defaults to `8443` to avoid the VLESS port.
 - `MTG_SECRET`: generated MTProto secret.
+- `FIREWALL_AUTO_CONFIG`: defaults to `true`; opens required host firewall ports during deploy.
+- `FIREWALL_OPEN_PANEL_PORT`: defaults to `true`; set to `false` only if the panel is not meant to be public.
 
 The generated VLESS link is written on the server to:
 

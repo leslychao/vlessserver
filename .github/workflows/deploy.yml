@@ -224,6 +224,144 @@ jobs:
           ./.deploy/scp-command.sh -P "$DEPLOY_PORT" .deploy.env "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$DEPLOY_DIR/.env"
           rm -f .deploy.env
 
+      - name: Configure remote firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.deploy/ssh-command.sh -p "$DEPLOY_PORT" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'bash -se' <<'EOF_REMOTE'
+          set -euo pipefail
+          cd /opt/proxy-stack/app
+
+          log() {
+            printf '[firewall-bootstrap] %s\n' "$*"
+          }
+
+          if [[ "$(id -u)" -eq 0 ]]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "[firewall-bootstrap] ERROR: root or sudo access is required to configure firewall rules" >&2
+            exit 1
+          fi
+
+          env_value() {
+            local key="$1"
+            local value
+            value="$(grep -E "^${key}=" .env | tail -n 1 | cut -d= -f2- || true)"
+            value="${value%$'\r'}"
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+            printf '%s' "$value"
+          }
+
+          is_enabled() {
+            case "${1,,}" in
+              1|true|yes|on) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          validate_port() {
+            local port="$1"
+            [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+          }
+
+          firewall_auto="$(env_value FIREWALL_AUTO_CONFIG)"
+          firewall_auto="${firewall_auto:-true}"
+          if ! is_enabled "$firewall_auto"; then
+            log "Firewall bootstrap disabled by FIREWALL_AUTO_CONFIG"
+            exit 0
+          fi
+
+          ssh_port="${{ secrets.DEPLOY_PORT || '22' }}"
+          vless_port="$(env_value VLESS_PORT)"
+          mtg_port="$(env_value MTG_BIND_PORT)"
+          panel_port="$(env_value XUI_PANEL_PORT)"
+          open_panel_port="$(env_value FIREWALL_OPEN_PANEL_PORT)"
+
+          vless_port="${vless_port:-443}"
+          mtg_port="${mtg_port:-8443}"
+          panel_port="${panel_port:-20530}"
+          open_panel_port="${open_panel_port:-true}"
+
+          requested_ports=("$ssh_port" "$vless_port" "$mtg_port")
+          if is_enabled "$open_panel_port"; then
+            requested_ports+=("$panel_port")
+          fi
+
+          ports=()
+          for port in "${requested_ports[@]}"; do
+            if ! validate_port "$port"; then
+              echo "[firewall-bootstrap] ERROR: invalid TCP port: $port" >&2
+              exit 1
+            fi
+            duplicate=false
+            for existing in "${ports[@]}"; do
+              if [[ "$existing" == "$port" ]]; then
+                duplicate=true
+                break
+              fi
+            done
+            if [[ "$duplicate" == "false" ]]; then
+              ports+=("$port")
+            fi
+          done
+
+          log "Required TCP ports: ${ports[*]}"
+
+          managed_firewall_active=false
+
+          if command -v ufw >/dev/null 2>&1; then
+            if $SUDO ufw status | grep -qi "Status: active"; then
+              managed_firewall_active=true
+              log "Configuring active ufw"
+              for port in "${ports[@]}"; do
+                $SUDO ufw allow "${port}/tcp" >/dev/null
+              done
+              $SUDO ufw reload >/dev/null || true
+            else
+              log "ufw is installed but inactive; leaving it disabled"
+            fi
+          fi
+
+          if command -v firewall-cmd >/dev/null 2>&1; then
+            if $SUDO firewall-cmd --state >/dev/null 2>&1; then
+              managed_firewall_active=true
+              log "Configuring active firewalld"
+              for port in "${ports[@]}"; do
+                $SUDO firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null
+              done
+              $SUDO firewall-cmd --reload >/dev/null
+            else
+              log "firewalld is installed but inactive; leaving it disabled"
+            fi
+          fi
+
+          if [[ "$managed_firewall_active" == "false" ]] && command -v iptables >/dev/null 2>&1; then
+            log "Configuring direct iptables accept rules"
+            for port in "${ports[@]}"; do
+              if ! $SUDO iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                $SUDO iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+              fi
+            done
+
+            if command -v netfilter-persistent >/dev/null 2>&1; then
+              $SUDO netfilter-persistent save >/dev/null || true
+              log "Saved iptables rules with netfilter-persistent"
+            elif command -v service >/dev/null 2>&1 && $SUDO service iptables status >/dev/null 2>&1; then
+              $SUDO service iptables save >/dev/null || true
+              log "Saved iptables rules with service iptables"
+            else
+              log "Direct iptables rules applied for the current runtime; no persistence helper found"
+            fi
+          elif [[ "$managed_firewall_active" == "false" ]]; then
+            log "No supported active host firewall detected"
+          fi
+          EOF_REMOTE
+
       - name: Deploy with Docker Compose
         shell: bash
         run: |
