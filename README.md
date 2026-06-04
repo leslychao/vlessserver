@@ -48,7 +48,7 @@ Important variables:
 - `XUI_ADMIN_PASSWORD`: long random panel password.
 - `XUI_PANEL_WEB_BASE_PATH`: non-root hidden panel path, for example `/admin-8f2d6c1a/`.
 - `PUBLIC_HOST`: primary VPS IP or domain used in the first generated VLESS link. Leave empty to auto-detect.
-- `ADDITIONAL_PUBLIC_IPS`: comma-separated secondary public IPv4 addresses. These are assigned to the VPS interface, get additional generated VLESS links, and are written to the inbound `externalProxy` list so 3x-ui UI links and QR codes advertise those IPs.
+- `ADDITIONAL_PUBLIC_IPS`: comma-separated secondary public IPv4 addresses. These are assigned to the VPS interface and get additional generated VLESS links.
 - `XRAY_OUTBOUND_SEND_THROUGH`: defaults to `origin`, so Xray outbound traffic uses the local IP that accepted the inbound connection.
 - `VLESS_PORT`: defaults to `443`.
 - `MTG_BIND_PORT`: defaults to `8443` to avoid the VLESS port.

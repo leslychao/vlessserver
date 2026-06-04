@@ -191,32 +191,6 @@ def public_hosts() -> list[str]:
     return unique_hosts
 
 
-def additional_public_ips() -> list[str]:
-    ips: list[str] = []
-    configured = env("ADDITIONAL_PUBLIC_IPS").strip()
-    if configured:
-        ips.extend(item.strip() for item in configured.split(",") if item.strip())
-
-    unique_ips: list[str] = []
-    for ip in ips:
-        if ip not in unique_ips:
-            unique_ips.append(ip)
-
-    return unique_ips
-
-
-def external_proxy_entries(hosts: list[str], port: int, remark: str) -> list[dict]:
-    return [
-        {
-            "remark": f"{remark}-{host}",
-            "dest": host,
-            "port": port,
-            "forceTls": "same",
-        }
-        for host in hosts
-    ]
-
-
 def generate_link(public_host: str, inbound: dict, display_remark: str | None = None) -> str:
     settings = load_nested_json(inbound.get("settings"))
     stream = load_nested_json(inbound.get("streamSettings"))
@@ -263,26 +237,6 @@ def find_existing_inbound(inbounds, remark: str):
         if inbound.get("remark") == remark:
             return inbound
     return None
-
-
-def sync_inbound_external_proxy(client: XuiClient, inbound: dict, proxies: list[dict]) -> bool:
-    stream = load_nested_json(inbound.get("streamSettings"))
-    current = stream.get("externalProxy")
-    if current == proxies:
-        log("Inbound externalProxy already matches configured additional public IPs")
-        return False
-
-    stream["externalProxy"] = proxies
-    payload = dict(inbound)
-    payload["streamSettings"] = json_string(stream)
-    inbound_id = payload.get("id")
-    if inbound_id is None:
-        fail("Existing inbound has no id, cannot update externalProxy")
-
-    client.api("POST", f"inbounds/update/{inbound_id}", payload)
-    inbound["streamSettings"] = payload["streamSettings"]
-    log("Inbound externalProxy updated for UI links and QR code")
-    return True
 
 
 def parse_panel_xray_response(response) -> tuple[dict, str]:
@@ -364,7 +318,6 @@ def main() -> None:
 
     remark = env("VLESS_REMARK", "vless-reality-main")
     hosts = public_hosts()
-    external_proxies = external_proxy_entries(additional_public_ips(), int_env("VLESS_PORT", 443), remark)
     output_file = env("PROVISION_OUTPUT_FILE", "/output/vless-reality.txt")
 
     xray_config_changed = configure_origin_sendthrough(client)
@@ -374,7 +327,6 @@ def main() -> None:
     existing = find_existing_inbound(inbounds, remark)
     if existing:
         log(f"Inbound '{remark}' already exists; no duplicate will be created")
-        sync_inbound_external_proxy(client, existing, external_proxies)
         links = [generate_link(host, existing, f"{remark}-{host}") for host in hosts]
         write_output(output_file, "\n".join(links))
         log(f"Connection link written to {output_file}")
@@ -427,7 +379,7 @@ def main() -> None:
     stream_settings = {
         "network": "tcp",
         "security": "reality",
-        "externalProxy": external_proxies,
+        "externalProxy": [],
         "realitySettings": {
             "show": False,
             "xver": 0,
