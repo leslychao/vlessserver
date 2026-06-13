@@ -13,6 +13,9 @@ import urllib.request
 import uuid
 
 
+DEFAULT_VLESS_PORT = 10443
+
+
 def log(message: str) -> None:
     print(f"[xui-provision] {message}", flush=True)
 
@@ -40,10 +43,22 @@ def bool_env(name: str, default: bool = False) -> bool:
 
 def int_env(name: str, default: int) -> int:
     value = env(name, str(default))
+    if value == "":
+        value = str(default)
     try:
         return int(value)
     except ValueError:
         fail(f"Environment variable {name} must be an integer")
+
+
+def validate_tcp_port(name: str, value: int) -> int:
+    if value < 1 or value > 65535:
+        fail(f"Environment variable {name} must be a TCP port between 1 and 65535")
+    return value
+
+
+def tcp_port_env(name: str, default: int) -> int:
+    return validate_tcp_port(name, int_env(name, default))
 
 
 def normalize_base_path(value: str) -> str:
@@ -239,6 +254,32 @@ def find_existing_inbound(inbounds, remark: str):
     return None
 
 
+def current_inbound_port(inbound: dict) -> int:
+    try:
+        return int(inbound.get("port", 0))
+    except (TypeError, ValueError):
+        fail(f"Existing inbound '{inbound.get('remark', '<unknown>')}' has an invalid port")
+
+
+def sync_existing_inbound_port(client: XuiClient, inbound: dict, desired_port: int) -> dict:
+    validate_tcp_port("VLESS_PORT", desired_port)
+    current_port = current_inbound_port(inbound)
+    if current_port == desired_port:
+        log(f"Inbound '{inbound.get('remark', '<unknown>')}' already uses port {desired_port}")
+        return inbound
+
+    inbound_id = inbound.get("id")
+    if inbound_id in (None, ""):
+        fail(f"Existing inbound '{inbound.get('remark', '<unknown>')}' cannot be updated because it has no id")
+
+    updated = dict(inbound)
+    updated["port"] = desired_port
+    log(f"Updating inbound '{updated.get('remark', '<unknown>')}' port from {current_port} to {desired_port}")
+    response = client.api("POST", f"inbounds/update/{inbound_id}", updated)
+    obj = api_obj(response)
+    return obj if isinstance(obj, dict) else updated
+
+
 def parse_panel_xray_response(response) -> tuple[dict, str]:
     obj = api_obj(response)
     if isinstance(obj, str):
@@ -317,6 +358,7 @@ def main() -> None:
     wait_for_panel(client)
 
     remark = env("VLESS_REMARK", "vless-reality-main")
+    inbound_port = tcp_port_env("VLESS_PORT", DEFAULT_VLESS_PORT)
     hosts = public_hosts()
     output_file = env("PROVISION_OUTPUT_FILE", "/output/vless-reality.txt")
 
@@ -326,11 +368,13 @@ def main() -> None:
     inbounds = api_obj(list_response) or []
     existing = find_existing_inbound(inbounds, remark)
     if existing:
+        port_changed = current_inbound_port(existing) != inbound_port
+        existing = sync_existing_inbound_port(client, existing, inbound_port)
         log(f"Inbound '{remark}' already exists; no duplicate will be created")
         links = [generate_link(host, existing, f"{remark}-{host}") for host in hosts]
         write_output(output_file, "\n".join(links))
         log(f"Connection link written to {output_file}")
-        if xray_config_changed:
+        if xray_config_changed or port_changed:
             try:
                 client.api("POST", "server/restartXrayService")
                 log("Xray restart requested")
@@ -352,7 +396,6 @@ def main() -> None:
         fail("VLESS_REALITY_SERVER_NAMES must contain at least one server name")
 
     client_email = env("VLESS_CLIENT_EMAIL", "main-client")
-    inbound_port = int_env("VLESS_PORT", 443)
     short_id = secrets.token_hex(4)
     sub_id = secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:16]
 

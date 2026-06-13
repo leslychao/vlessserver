@@ -448,7 +448,7 @@ jobs:
           panel_port="$(env_value XUI_PANEL_PORT)"
           open_panel_port="$(env_value FIREWALL_OPEN_PANEL_PORT)"
 
-          vless_port="${vless_port:-443}"
+          vless_port="${vless_port:-10443}"
           mtg_port="${mtg_port:-8443}"
           panel_port="${panel_port:-20530}"
           open_panel_port="${open_panel_port:-true}"
@@ -574,7 +574,7 @@ jobs:
           panel_path="${panel_path:-/admin/}"
           panel_port="${panel_port:-20530}"
           tls_enabled="${tls_enabled:-true}"
-          vless_port="${vless_port:-443}"
+          vless_port="${vless_port:-10443}"
           mtg_port="${mtg_port:-8443}"
           [[ "$panel_path" == /* ]] || panel_path="/$panel_path"
           [[ "$panel_path" == */ ]] || panel_path="$panel_path/"
